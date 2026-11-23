@@ -1,0 +1,248 @@
+From 84ebebd20d8187b679416399040d9d2748698bcd Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Authenticate the compressed boot archive before gzip reads it
+
+diff --git a/usr/src/boot/common/bootstrap.h b/usr/src/boot/common/bootstrap.h
+--- a/usr/src/boot/common/bootstrap.h
++++ b/usr/src/boot/common/bootstrap.h
+@@ -368,6 +368,7 @@ struct arch_switch
+ 	 */
+ 	vm_offset_t (*arch_loadaddr)(uint_t type, void *data, vm_offset_t addr);
+ 	bool (*arch_kernel_allowed)(const char *path);
++	bool (*arch_archive_allowed)(const char *path);
+ #define	LOAD_ELF	1	/* data points to the ELF header. */
+ #define	LOAD_RAW	2	/* data points to the module file name. */
+ #define	LOAD_KERN	3	/* data points to the kernel file name. */
+diff --git a/usr/src/boot/common/module.c b/usr/src/boot/common/module.c
+--- a/usr/src/boot/common/module.c
++++ b/usr/src/boot/common/module.c
+@@ -721,8 +721,18 @@ file_loadraw(const char *fname, char *type, int argc, char **argv, int insert)
+ 		return (NULL);
+ 	}
+ 
+-	/* locate the file on the load path */
+-	name = file_search(fname, NULL);
++	/* The verified rootfs path needs no search or preliminary open. */
++	if (archsw.arch_archive_allowed != NULL &&
++	    strcmp(type, "rootfs") == 0) {
++		if (!archsw.arch_archive_allowed(fname)) {
++			command_errmsg =
++			    "rootfs path outside verified boot policy";
++			return (NULL);
++		}
++		name = strdup(fname);
++	} else {
++		name = file_search(fname, NULL);
++	}
+ 	if (name == NULL) {
+ 		(void) snprintf(command_errbuf, sizeof (command_errbuf),
+ 		    "can't find '%s'", fname);
+diff --git a/usr/src/boot/efi/loader/verified-config.h b/usr/src/boot/efi/loader/verified-config.h
+--- a/usr/src/boot/efi/loader/verified-config.h
++++ b/usr/src/boot/efi/loader/verified-config.h
+@@ -17,6 +17,8 @@ struct verified_startup_file {
+ 	const char *path;
+ 	size_t length;
+ 	unsigned char *bytes;
++	EFI_PHYSICAL_ADDRESS address;
++	UINTN pages;
+ };
+ 
+ static unsigned char verified_manifest[64 * 1024 + 1];
+@@ -27,6 +29,10 @@ static ssize_t verified_config_read_file(const char *, unsigned char *, size_t);
+ 
+ #define	VERIFIED_CONFIG_LIMIT (64 * 1024)
+ #define	VERIFIED_KERNEL_LIMIT (16 * 1024 * 1024)
++#define	VERIFIED_ARCHIVE_LIMIT (256 * 1024 * 1024)
++
++static const char verified_archive_path[] =
++	"/platform/i86pc/amd64/boot_archive";
+ 
+ static const char verified_kernel_path[] =
+ 	"/platform/i86pc/kernel/amd64/unix";
+@@ -38,6 +44,12 @@ static struct verified_startup_file verified_startup_files[] = {
+ 	{ .path = "/boot/loader.conf", .bytes = verified_startup_bytes[2] }
+ };
+ 
++static bool
++verified_archive_allowed(const char *path)
++{
++	return (path != NULL && strcmp(path, verified_archive_path) == 0);
++}
++
+ static bool
+ verified_kernel_allowed(const char *path)
+ {
+@@ -89,18 +101,96 @@ verified_config_open(const char *path, struct open_file *file)
+ 			return (EAUTH);
+ 		}
+ 		snapshot->path = NULL;
++		snapshot->pages = 0;
+ 		snapshot->length = length;
+ 	}
+ 
+ 	file->f_fsdata = snapshot;
+ 	return (0);
+ }
+ 
++/*
++ * Open the compressed archive for gzip. Allocate the snapshot outside the
++ * standalone heap, which is too small for an installed boot archive.
++ */
++static int
++verified_archive_raw_open(const char *path, struct open_file *file)
++{
++	struct verified_startup_file *snapshot;
++	struct stat st;
++	int fd;
++	ssize_t count;
++	size_t offset = 0;
++	unsigned char extra;
++
++	snapshot = calloc(1, sizeof (*snapshot));
++	if (snapshot == NULL)
++		return (EAUTH);
++
++	opening_raw_startup_file = true;
++	fd = open(path, O_RDONLY | F_GZIP);
++	opening_raw_startup_file = false;
++	if (fd == -1)
++		goto fail;
++	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
++	    st.st_size <= 0 || st.st_size > VERIFIED_ARCHIVE_LIMIT)
++		goto fail;
++	snapshot->length = st.st_size;
++	snapshot->pages = EFI_SIZE_TO_PAGES(snapshot->length);
++	snapshot->address = 0xffffffff;
++	if (EFI_ERROR(BS->AllocatePages(AllocateMaxAddress, EfiLoaderData,
++	    snapshot->pages, &snapshot->address))) {
++		snapshot->pages = 0;
++		goto fail;
++	}
++	snapshot->bytes = (unsigned char *)(uintptr_t)snapshot->address;
++	while (offset < snapshot->length) {
++		count = read(fd, snapshot->bytes + offset,
++		    snapshot->length - offset);
++		if (count <= 0)
++			goto fail;
++		offset += count;
++	}
++	if (read(fd, &extra, 1) != 0 ||
++	    !valparaiso_check_boot_file(verified_manifest,
++	    verified_manifest_length, path + 1, snapshot->bytes,
++	    snapshot->length))
++		goto fail;
++
++	(void) close(fd);
++	file->f_fsdata = snapshot;
++	return (0);
++
++fail:
++	if (fd != -1)
++		(void) close(fd);
++	if (snapshot->pages != 0)
++		(void) BS->FreePages(snapshot->address, snapshot->pages);
++	free(snapshot);
++	printf("Valparaiso: rejected %s\n", path);
++	return (EAUTH);
++}
++
++static int
++verified_archive_open(const char *path, struct open_file *file)
++{
++	int error;
++
++	if (file->f_flags != (F_READ | F_NODEV))
++		return (EACCES);
++	file->f_flags = F_READ;
++	error = gzipfs_fsops.fo_open(path, file);
++	file->f_flags = F_READ | F_NODEV;
++	return (error);
++}
++
+ static int
+ verified_config_close(struct open_file *file)
+ {
+ 	struct verified_startup_file *snapshot = file->f_fsdata;
+ 
++	if (snapshot->pages != 0)
++		(void) BS->FreePages(snapshot->address, snapshot->pages);
+ 	if (snapshot->path == NULL)
+ 		free(snapshot);
+ 	return (0);
+@@ -171,11 +261,17 @@ static struct fs_ops verified_config_ops = {
+ 	.fo_readdir = null_readdir
+ };
+ 
++static struct fs_ops verified_archive_raw_ops;
++static struct fs_ops verified_archive_ops;
++
+ static struct fs_ops *
+-verified_config_override(const char *path)
++verified_config_override(const char *path, int mode)
+ {
+ 	if (opening_raw_startup_file)
+ 		return (NULL);
++	if (verified_archive_allowed(path))
++		return (mode == (O_RDONLY | F_GZIP) ?
++		    &verified_archive_raw_ops : &verified_archive_ops);
+ 	if (verified_kernel_allowed(path) ||
+ 	    verified_config_find(path) != NULL ||
+ 	    strncmp(path, "/boot/forth/", sizeof ("/boot/forth/") - 1) == 0 ||
+@@ -255,7 +351,12 @@ verified_config_init(void)
+ 	}
+ 
+ 	verified_manifest_length = mlen;
++	verified_archive_raw_ops = verified_config_ops;
++	verified_archive_raw_ops.fo_open = verified_archive_raw_open;
++	verified_archive_ops = gzipfs_fsops;
++	verified_archive_ops.fo_open = verified_archive_open;
+ 	stand_file_override = verified_config_override;
+ 	archsw.arch_kernel_allowed = verified_kernel_allowed;
++	archsw.arch_archive_allowed = verified_archive_allowed;
+ 	return (true);
+ }
+diff --git a/usr/src/boot/libsa/gzipfs.c b/usr/src/boot/libsa/gzipfs.c
+--- a/usr/src/boot/libsa/gzipfs.c
++++ b/usr/src/boot/libsa/gzipfs.c
+@@ -188,6 +188,8 @@ zf_open(const char *fname, struct open_file *f)
+ 	/* Try to open the compressed datafile */
+ 	rawfd = open(fname, O_RDONLY | F_GZIP);
+ 	if (rawfd == -1) {
++		if (errno == EAUTH)
++			return (EAUTH);
+ 		/* add .gz sufix and try again */
+ 		zfname = malloc(strlen(fname) + 4);
+ 		if (zfname == NULL)
+diff --git a/usr/src/boot/libsa/open.c b/usr/src/boot/libsa/open.c
+--- a/usr/src/boot/libsa/open.c
++++ b/usr/src/boot/libsa/open.c
+@@ -135,7 +135,7 @@ o_rainit(struct open_file *f)
+ 	f->f_raoffset = 0;
+ }
+ 
+-struct fs_ops *(*stand_file_override)(const char *);
++struct fs_ops *(*stand_file_override)(const char *, int);
+ 
+ int
+ open(const char *fname, int mode)
+@@ -162,7 +162,7 @@ open(const char *fname, int mode)
+ 	 * Failure opening an overridden file must never fall back to disk.
+ 	 */
+ 	if (stand_file_override != NULL &&
+-	    (fs = stand_file_override(fname)) != NULL) {
++	    (fs = stand_file_override(fname, mode)) != NULL) {
+ 		f->f_flags |= F_NODEV;
+ 		error = fs->fo_open(fname, f);
+ 		if (error == 0)
+diff --git a/usr/src/boot/libsa/stand.h b/usr/src/boot/libsa/stand.h
+--- a/usr/src/boot/libsa/stand.h
++++ b/usr/src/boot/libsa/stand.h
+@@ -287,7 +287,7 @@ extern void	ngets(char *, int);
+ #define	gets(x)	ngets((x), 0)
+ extern int	fgetstr(char *buf, int size, int fd);
+ 
+-extern struct fs_ops *(*stand_file_override)(const char *);
++extern struct fs_ops *(*stand_file_override)(const char *, int);
+ extern int	open(const char *, int);
+ #define	O_RDONLY	0x0
+ #define	O_WRONLY	0x1

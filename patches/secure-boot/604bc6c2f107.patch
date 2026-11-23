@@ -1,0 +1,157 @@
+From 604bc6c2f107a463dbf12150353b7dce8236e0d6 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Preserve signed EFI loaders during installation
+
+diff --git a/usr/src/cmd/boot/installboot/i386/installboot.c b/usr/src/cmd/boot/installboot/i386/installboot.c
+--- a/usr/src/cmd/boot/installboot/i386/installboot.c
++++ b/usr/src/cmd/boot/installboot/i386/installboot.c
+@@ -38,6 +38,7 @@
+ #include <time.h>
+ #include <spawn.h>
+ 
++#include <sys/byteorder.h>
+ #include <sys/dktp/fdisk.h>
+ #include <sys/dkio.h>
+ #include <sys/vtoc.h>
+@@ -317,6 +318,78 @@ mkfs_pcfs(const char *dev)
+ 	return (status != -1);
+ }
+ 
++/*
++ * PE32 and PE32+ place the certificate table at data-directory index 4.
++ * Its presence is enough to prohibit modifying the image. Firmware still
++ * validates the signature and trust chain.
++ */
++static bool
++efi_has_certificate_table(const ib_bootblock_t *bblock)
++{
++	const uint8_t *image = (const uint8_t *)bblock->file;
++	size_t size = bblock->source_size;
++	size_t pe, optional, optional_size, directory;
++	uint16_t magic;
++
++	if (size < 64 || LE_IN16(image) != 0x5a4d)
++		return (false);
++	pe = LE_IN32(image + 60);
++	if (pe > size || size - pe < 24 ||
++	    LE_IN32(image + pe) != 0x00004550)
++		return (false);
++
++	optional = pe + 24;
++	optional_size = LE_IN16(image + pe + 20);
++	if (optional_size < 2 || optional_size > size - optional)
++		return (false);
++	magic = LE_IN16(image + optional);
++	if (magic == 0x10b)
++		directory = 96;
++	else if (magic == 0x20b)
++		directory = 112;
++	else
++		return (false);
++
++	if (optional_size < directory + 5 * 8 ||
++	    LE_IN32(image + optional + directory - 4) < 5)
++		return (false);
++	directory += optional + 4 * 8;
++	return (LE_IN32(image + directory) != 0 ||
++	    LE_IN32(image + directory + 4) != 0);
++}
++
++static void
++install_signed_efi(const char *file, ib_bootblock_t *bblock)
++{
++	char *temp;
++	int fd, status;
++
++	if (asprintf(&temp, "%s.XXXXXX", file) < 0) {
++		perror(gettext("Memory allocation failure"));
++		return;
++	}
++	fd = mkstemp(temp);
++	if (fd == -1) {
++		perror("mkstemp");
++		free(temp);
++		return;
++	}
++	status = write_out(fd, bblock->buf, bblock->source_size, 0);
++	if (status == BC_SUCCESS && fsync(fd) != 0)
++		status = BC_ERROR;
++	if (close(fd) != 0)
++		status = BC_ERROR;
++	if (status != BC_SUCCESS || rename(temp, file) != 0) {
++		(void) fprintf(stderr, gettext("error while installing %s\n"),
++		    file);
++		(void) unlink(temp);
++	} else {
++		(void) fprintf(stdout, gettext("bootblock written to %s\n\n"),
++		    file);
++	}
++	free(temp);
++}
++
+ static void
+ install_esp_cb(void *data, struct partlist *plist)
+ {
+@@ -406,6 +479,12 @@ install_esp_cb(void *data, struct partlist *plist)
+ 		return;
+ 	}
+ 
++	if (efi_has_certificate_table(bblock)) {
++		install_signed_efi(file, bblock);
++		free(file);
++		return;
++	}
++
+ 	/* Write stage file. Should create temp file and rename. */
+ 	(void) chmod(file, S_IRUSR | S_IWUSR);
+ 	fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+@@ -1800,16 +1879,17 @@ read_bootblock_from_file(const char *file, ib_bootblock_t *bblock)
+ 	}
+ 
+ 	/* loader bootblock has version built in */
+-	buf_size = sb.st_size;
+-	if (buf_size == 0)
++	if (sb.st_size <= 0 || sb.st_size > UINT32_MAX - sector_size)
+ 		goto outfd;
++	buf_size = sb.st_size;
++	bblock->source_size = buf_size;
+ 
+ 	/* Round up to sector size for raw disk write */
+ 	bblock->buf_size = P2ROUNDUP(buf_size, sector_size);
+ 	BOOT_DEBUG("bootblock in-memory buffer size is %d\n",
+ 	    bblock->buf_size);
+ 
+-	bblock->buf = malloc(bblock->buf_size);
++	bblock->buf = calloc(1, bblock->buf_size);
+ 	if (bblock->buf == NULL) {
+ 		perror(gettext("Memory allocation failure"));
+ 		goto outbuf;
+@@ -1835,6 +1915,8 @@ read_bootblock_from_file(const char *file, ib_bootblock_t *bblock)
+ 
+ 	bblock->file_size =
+ 	    bblock->mboot->load_end_addr - bblock->mboot->load_addr;
++	if (bblock->file_size > bblock->source_size)
++		goto outbuf;
+ 	BOOT_DEBUG("bootblock file size is %d\n", bblock->file_size);
+ 
+ 	bblock->extra = bblock->buf + P2ROUNDUP(bblock->file_size, 8);
+@@ -1948,7 +2030,8 @@ prepare_bootblock(ib_data_t *data, struct partlist *pl, char *updt_str)
+ 	assert(pl != NULL);
+ 
+ 	bblock = pl->pl_src_data;
+-	if (bblock == NULL)
++	if (bblock == NULL || (pl->pl_type == IB_BBLK_EFI &&
++	    efi_has_certificate_table(bblock)))
+ 		return;
+ 
+ 	ptr = (uint64_t *)(&bblock->mboot->bss_end_addr);
+diff --git a/usr/src/cmd/boot/installboot/i386/installboot.h b/usr/src/cmd/boot/installboot/i386/installboot.h
+--- a/usr/src/cmd/boot/installboot/i386/installboot.h
++++ b/usr/src/cmd/boot/installboot/i386/installboot.h
+@@ -92,6 +92,7 @@ typedef struct _ib_bootblock {
+ 	uint32_t		mboot_off;
+ 	uint32_t		file_size;
+ 	uint32_t		buf_size;
++	uint32_t		source_size;
+ 	uint32_t		extra_size;
+ } ib_bootblock_t;
+ 

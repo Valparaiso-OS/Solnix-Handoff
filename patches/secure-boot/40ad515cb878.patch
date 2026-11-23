@@ -1,0 +1,154 @@
+From 40ad515cb8786cc1c8a9634905ba263372bb663e Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Verify and snapshot the loader startup script and defaults
+
+diff --git a/usr/src/boot/efi/loader/main.c b/usr/src/boot/efi/loader/main.c
+--- a/usr/src/boot/efi/loader/main.c
++++ b/usr/src/boot/efi/loader/main.c
+@@ -941,7 +941,7 @@ main(int argc, CHAR16 *argv[])
+ 
+ #ifdef VALPARAISO_VERIFY_CONFIG
+ 	if (!verified_config_init()) {
+-		printf("Valparaiso loader.conf verification failed\n");
++		printf("Valparaiso startup file verification failed\n");
+ 		return (EFI_SECURITY_VIOLATION);
+ 	}
+ #endif
+diff --git a/usr/src/boot/efi/loader/verified-config.h b/usr/src/boot/efi/loader/verified-config.h
+--- a/usr/src/boot/efi/loader/verified-config.h
++++ b/usr/src/boot/efi/loader/verified-config.h
+@@ -8,27 +8,53 @@
+  * source. A copy is also available at http://www.illumos.org/license/CDDL.
+  */
+ 
+-extern int valparaiso_check_config(const void *, size_t, const void *, size_t,
++extern int valparaiso_check_manifest(const void *, size_t, const void *,
++    size_t);
++extern int valparaiso_check_boot_file(const void *, size_t, const char *,
+     const void *, size_t);
+ 
+-static unsigned char verified_config[64 * 1024 + 1];
+-static size_t verified_config_length;
++struct verified_startup_file {
++	const char *path;
++	size_t length;
++	unsigned char bytes[64 * 1024 + 1];
++};
++
++static struct verified_startup_file verified_startup_files[] = {
++	{ .path = "/boot/loader.rc" },
++	{ .path = "/boot/defaults/loader.conf" },
++	{ .path = "/boot/loader.conf" }
++};
++
++static struct verified_startup_file *
++verified_config_find(const char *path)
++{
++	for (size_t i = 0; i < sizeof (verified_startup_files) /
++	    sizeof (verified_startup_files[0]); i++) {
++		if (strcmp(path, verified_startup_files[i].path) == 0)
++			return (&verified_startup_files[i]);
++	}
++	return (NULL);
++}
+ 
+ static int
+-verified_config_open(const char *path __unused, struct open_file *file)
++verified_config_open(const char *path, struct open_file *file)
+ {
+-	return (file->f_flags == (F_READ | F_NODEV) ? 0 : EACCES);
++	if (file->f_flags != (F_READ | F_NODEV))
++		return (EACCES);
++	file->f_fsdata = verified_config_find(path);
++	return (file->f_fsdata != NULL ? 0 : ENOENT);
+ }
+ 
+ static int
+ verified_config_read(struct open_file *file, void *buffer, size_t size,
+     size_t *resid)
+ {
+-	size_t count = verified_config_length - (size_t)file->f_offset;
++	const struct verified_startup_file *snapshot = file->f_fsdata;
++	size_t count = snapshot->length - (size_t)file->f_offset;
+ 
+ 	if (count > size)
+ 		count = size;
+-	bcopy(verified_config + file->f_offset, buffer, count);
++	bcopy(snapshot->bytes + file->f_offset, buffer, count);
+ 	file->f_offset += count;
+ 	*resid = size - count;
+ 	return (0);
+@@ -37,8 +63,9 @@ verified_config_read(struct open_file *file, void *buffer, size_t size,
+ static off_t
+ verified_config_seek(struct open_file *file, off_t offset, int where)
+ {
++	const struct verified_startup_file *snapshot = file->f_fsdata;
+ 	off_t base;
+-	off_t length = verified_config_length;
++	off_t length = snapshot->length;
+ 
+ 	switch (where) {
+ 	case SEEK_SET:
+@@ -62,11 +89,13 @@ verified_config_seek(struct open_file *file, off_t offset, int where)
+ }
+ 
+ static int
+-verified_config_stat(struct open_file *file __unused, struct stat *st)
++verified_config_stat(struct open_file *file, struct stat *st)
+ {
++	const struct verified_startup_file *snapshot = file->f_fsdata;
++
+ 	bzero(st, sizeof (*st));
+ 	st->st_mode = S_IFREG | 0444;
+-	st->st_size = verified_config_length;
++	st->st_size = snapshot->length;
+ 	return (0);
+ }
+ 
+@@ -84,7 +113,7 @@ static struct fs_ops verified_config_ops = {
+ static struct fs_ops *
+ verified_config_override(const char *path)
+ {
+-	if (strcmp(path, "/boot/loader.conf") == 0)
++	if (verified_config_find(path) != NULL)
+ 		return (&verified_config_ops);
+ 	return (NULL);
+ }
+@@ -117,20 +146,31 @@ verified_config_init(void)
+ {
+ 	static unsigned char manifest[64 * 1024 + 1];
+ 	static unsigned char signature[3309 + 1];
+-	ssize_t mlen, slen, clen;
++	ssize_t mlen, slen;
+ 
+ 	mlen = verified_config_read_file("/boot.manifest", manifest,
+ 	    sizeof (manifest));
+ 	slen = verified_config_read_file("/boot.manifest.sig", signature,
+ 	    sizeof (signature));
+-	clen = verified_config_read_file("/boot/loader.conf", verified_config,
+-	    sizeof (verified_config));
+-	if (mlen < 0 || slen < 0 || clen < 0 ||
+-	    !valparaiso_check_config(manifest, mlen, signature, slen,
+-	    verified_config, clen))
++	if (mlen < 0 || slen < 0 ||
++	    !valparaiso_check_manifest(manifest, mlen, signature, slen))
+ 		return (false);
+ 
+-	verified_config_length = clen;
++	for (size_t i = 0; i < sizeof (verified_startup_files) /
++	    sizeof (verified_startup_files[0]); i++) {
++		struct verified_startup_file *snapshot =
++		    &verified_startup_files[i];
++		ssize_t length = verified_config_read_file(snapshot->path,
++		    snapshot->bytes, sizeof (snapshot->bytes));
++
++		if (length < 0 || !valparaiso_check_boot_file(manifest, mlen,
++		    snapshot->path + 1, snapshot->bytes, length)) {
++			printf("Valparaiso: rejected %s\n", snapshot->path);
++			return (false);
++		}
++		snapshot->length = length;
++	}
++
+ 	stand_file_override = verified_config_override;
+ 	return (true);
+ }

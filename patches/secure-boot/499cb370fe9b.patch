@@ -1,0 +1,198 @@
+From 499cb370fe9b2d14eae1913fe7bb5b8dfadbab2f Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Restrict the EFI QA loader to an enforcing firmware and one boot root
+
+diff --git a/usr/src/boot/efi/loader/main.c b/usr/src/boot/efi/loader/main.c
+--- a/usr/src/boot/efi/loader/main.c
++++ b/usr/src/boot/efi/loader/main.c
+@@ -759,6 +759,11 @@ main(int argc, CHAR16 *argv[])
+ 	 * args from UCS-2 to ASCII (16 to 8 bit) as they are copied (though
+ 	 * this method is flawed for non-ASCII characters).
+ 	 */
++#ifdef VALPARAISO_VERIFY_CONFIG
++	/* Firmware load options are outside the signed boot manifest. */
++	if (argc > 1)
++		argc = 1;
++#endif
+ 	for (i = 1; i < argc; i++) {
+ 		if (argv[i][0] == '-') {
+ 			for (j = 1; argv[i][j] != 0; j++) {
+@@ -935,16 +940,35 @@ main(int argc, CHAR16 *argv[])
+ 	 * the boot protocol and also allow an escape hatch for users wishing
+ 	 * to try something different.
+ 	 */
++#ifdef VALPARAISO_VERIFY_CONFIG
++	if (!verified_firmware_enforcing()) {
++		printf("Valparaiso requires UEFI Secure Boot enforcement\n");
++		return (EFI_SECURITY_VIOLATION);
++	}
+ 	if (!find_currdev(boot_img))
+-		if (!interactive_interrupt("Failed to find bootable partition"))
+-			return (EFI_NOT_FOUND);
++		return (EFI_NOT_FOUND);
++
++	struct env_var *current = env_getenv("currdev");
++	if (current == NULL || current->ev_value == NULL)
++		return (EFI_NOT_FOUND);
++	current->ev_sethook = env_noset;
++	current->ev_unsethook = env_nounset;
++	if (env_setenv("rootdev", EV_VOLATILE | EV_NOHOOK, current->ev_value,
++	    env_noset, env_nounset) != 0)
++		return (EFI_SECURITY_VIOLATION);
++	struct env_var *root = env_getenv("rootdev");
++	root->ev_sethook = env_noset;
++	root->ev_unsethook = env_nounset;
+ 
+-#ifdef VALPARAISO_VERIFY_CONFIG
+ 	if (!verified_config_init()) {
+ 		printf("Valparaiso startup file verification failed\n");
+ 		return (EFI_SECURITY_VIOLATION);
+ 	}
+ #else
++	if (!find_currdev(boot_img))
++		if (!interactive_interrupt("Failed to find bootable partition"))
++			return (EFI_NOT_FOUND);
++
+ 	autoload_font(false);		/* Set up the font list for console. */
+ #endif
+ 	efi_init_environment();
+@@ -955,7 +979,19 @@ main(int argc, CHAR16 *argv[])
+ 		ptr = efi_get_table(&gEfiSmbiosTableGuid);
+ 	smbios_detect(ptr);
+ 
++#ifdef VALPARAISO_VERIFY_CONFIG
++	/*
++	 * The signed loader definitions handle configuration and module
++	 * setup. Omit the interactive loader shell in this single-root build.
++	 */
++	bf_init(NULL);
++	if (include("/boot/forth/loader.4th") != CMD_OK)
++		return (EFI_SECURITY_VIOLATION);
++	(void) autoboot(-2, NULL);
++	return (EFI_SECURITY_VIOLATION);
++#else
+ 	interact(NULL);			/* doesn't return */
++#endif
+ 
+ 	return (EFI_SUCCESS);		/* keep compiler happy */
+ }
+diff --git a/usr/src/boot/efi/loader/verified-config.h b/usr/src/boot/efi/loader/verified-config.h
+--- a/usr/src/boot/efi/loader/verified-config.h
++++ b/usr/src/boot/efi/loader/verified-config.h
+@@ -274,6 +274,78 @@ static struct fs_ops verified_config_ops = {
+ 	.fo_readdir = null_readdir
+ };
+ 
++/*
++ * Let Forth enumerate the configuration directory. Only its entries, never
++ * disk file data, are exposed through this descriptor.
++ */
++static int
++verified_confdir_open(const char *path, struct open_file *file)
++{
++	struct stat st;
++	int fd;
++
++	if (file->f_flags != (F_READ | F_NODEV))
++		return (EACCES);
++	opening_raw_startup_file = true;
++	fd = open(path, O_RDONLY | F_GZIP);
++	opening_raw_startup_file = false;
++	if (fd == -1)
++		return (errno);
++	if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode)) {
++		(void) close(fd);
++		return (ENOTDIR);
++	}
++	file->f_fsdata = fd2open_file(fd);
++	return (0);
++}
++
++static int
++verified_confdir_close(struct open_file *file)
++{
++	struct open_file *directory = file->f_fsdata;
++
++	return (close(directory->f_id) == 0 ? 0 : errno);
++}
++
++static int
++verified_confdir_stat(struct open_file *file, struct stat *st)
++{
++	struct open_file *directory = file->f_fsdata;
++
++	return (directory->f_ops->fo_stat(directory, st));
++}
++
++static int
++verified_confdir_readdir(struct open_file *file, struct dirent *entry)
++{
++	struct open_file *directory = file->f_fsdata;
++
++	return (directory->f_ops->fo_readdir(directory, entry));
++}
++
++static int
++verified_file_denied(const char *path __unused,
++    struct open_file *file __unused)
++{
++	return (EAUTH);
++}
++
++static struct fs_ops verified_confdir_ops = {
++	.fs_name = "verified-confdir",
++	.fo_open = verified_confdir_open,
++	.fo_close = verified_confdir_close,
++	.fo_read = null_read,
++	.fo_write = null_write,
++	.fo_seek = null_seek,
++	.fo_stat = verified_confdir_stat,
++	.fo_readdir = verified_confdir_readdir
++};
++
++static struct fs_ops verified_denied_ops = {
++	.fs_name = "verified-denied",
++	.fo_open = verified_file_denied
++};
++
+ static struct fs_ops verified_archive_raw_ops;
+ static struct fs_ops verified_archive_ops;
+ 
+@@ -282,6 +354,8 @@ verified_config_override(const char *path, int mode)
+ {
+ 	if (opening_raw_startup_file)
+ 		return (NULL);
++	if (strcmp(path, "/boot/conf.d") == 0)
++		return (&verified_confdir_ops);
+ 	if (verified_archive_allowed(path))
+ 		return (mode == (O_RDONLY | F_GZIP) ?
+ 		    &verified_archive_raw_ops : &verified_archive_ops);
+@@ -298,7 +372,7 @@ verified_config_override(const char *path, int mode)
+ 	    strcmp(path, "/boot/loader.conf.local") == 0 ||
+ 	    strcmp(path, "/boot/solaris/bootenv.rc") == 0)
+ 		return (&verified_config_ops);
+-	return (NULL);
++	return (&verified_denied_ops);
+ }
+ 
+ static ssize_t
+@@ -334,6 +408,20 @@ verified_config_read_file(const char *path, unsigned char *buffer, size_t limit)
+ 	return (length);
+ }
+ 
++static bool
++verified_firmware_enforcing(void)
++{
++	UINT8 secure_boot = 0, setup_mode = 1;
++	size_t length = sizeof (secure_boot);
++
++	if (EFI_ERROR(efi_global_getenv("SecureBoot", &secure_boot, &length)) ||
++	    length != sizeof (secure_boot) || secure_boot != 1)
++		return (false);
++	length = sizeof (setup_mode);
++	return (!EFI_ERROR(efi_global_getenv("SetupMode", &setup_mode,
++	    &length)) && length == sizeof (setup_mode) && setup_mode == 0);
++}
++
+ static bool
+ verified_config_init(void)
+ {

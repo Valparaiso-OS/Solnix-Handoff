@@ -1,0 +1,120 @@
+From fc52726ee6b1d987ab3b1430a463698a60280f57 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Authenticate the amd64 kernel before the EFI loader parses it
+
+diff --git a/usr/src/boot/common/bootstrap.h b/usr/src/boot/common/bootstrap.h
+--- a/usr/src/boot/common/bootstrap.h
++++ b/usr/src/boot/common/bootstrap.h
+@@ -367,6 +367,7 @@ struct arch_switch
+ 	 * being loaded.
+ 	 */
+ 	vm_offset_t (*arch_loadaddr)(uint_t type, void *data, vm_offset_t addr);
++	bool (*arch_kernel_allowed)(const char *path);
+ #define	LOAD_ELF	1	/* data points to the ELF header. */
+ #define	LOAD_RAW	2	/* data points to the module file name. */
+ #define	LOAD_KERN	3	/* data points to the kernel file name. */
+diff --git a/usr/src/boot/common/module.c b/usr/src/boot/common/module.c
+--- a/usr/src/boot/common/module.c
++++ b/usr/src/boot/common/module.c
+@@ -342,8 +342,16 @@ file_load(char *filename, vm_offset_t dest, struct preloaded_file **result)
+ 	int error;
+ 	int i;
+ 
+-	if (preloaded_files == NULL)
++	if (preloaded_files == NULL) {
+ 		last_file_format = 0;
++		if (archsw.arch_kernel_allowed != NULL &&
++		    !archsw.arch_kernel_allowed(filename)) {
++			(void) snprintf(command_errbuf, sizeof (command_errbuf),
++			    "kernel path outside verified boot policy: %s",
++			    filename);
++			return (EAUTH);
++		}
++	}
+ 
+ 	error = EFTYPE;
+ 	for (i = last_file_format, fp = NULL;
+diff --git a/usr/src/boot/efi/loader/verified-config.h b/usr/src/boot/efi/loader/verified-config.h
+--- a/usr/src/boot/efi/loader/verified-config.h
++++ b/usr/src/boot/efi/loader/verified-config.h
+@@ -16,7 +16,7 @@ extern int valparaiso_check_boot_file(const void *, size_t, const char *,
+ struct verified_startup_file {
+ 	const char *path;
+ 	size_t length;
+-	unsigned char bytes[64 * 1024 + 1];
++	unsigned char *bytes;
+ };
+ 
+ static unsigned char verified_manifest[64 * 1024 + 1];
+@@ -25,12 +25,25 @@ static bool opening_raw_startup_file;
+ 
+ static ssize_t verified_config_read_file(const char *, unsigned char *, size_t);
+ 
++#define	VERIFIED_CONFIG_LIMIT (64 * 1024)
++#define	VERIFIED_KERNEL_LIMIT (16 * 1024 * 1024)
++
++static const char verified_kernel_path[] =
++	"/platform/i86pc/kernel/amd64/unix";
++static unsigned char verified_startup_bytes[3][VERIFIED_CONFIG_LIMIT + 1];
+ static struct verified_startup_file verified_startup_files[] = {
+-	{ .path = "/boot/loader.rc" },
+-	{ .path = "/boot/defaults/loader.conf" },
+-	{ .path = "/boot/loader.conf" }
++	{ .path = "/boot/loader.rc", .bytes = verified_startup_bytes[0] },
++	{ .path = "/boot/defaults/loader.conf",
++	    .bytes = verified_startup_bytes[1] },
++	{ .path = "/boot/loader.conf", .bytes = verified_startup_bytes[2] }
+ };
+ 
++static bool
++verified_kernel_allowed(const char *path)
++{
++	return (path != NULL && strcmp(path, verified_kernel_path) == 0);
++}
++
+ static struct verified_startup_file *
+ verified_config_find(const char *path)
+ {
+@@ -53,11 +66,15 @@ verified_config_open(const char *path, struct open_file *file)
+ 
+ 	snapshot = verified_config_find(path);
+ 	if (snapshot == NULL) {
+-		snapshot = malloc(sizeof (*snapshot));
++		size_t limit = verified_kernel_allowed(path) ?
++		    VERIFIED_KERNEL_LIMIT : VERIFIED_CONFIG_LIMIT;
++
++		snapshot = malloc(sizeof (*snapshot) + limit + 1);
+ 		if (snapshot == NULL)
+ 			return (ENOMEM);
++		snapshot->bytes = (unsigned char *)(snapshot + 1);
+ 		length = verified_config_read_file(path, snapshot->bytes,
+-		    sizeof (snapshot->bytes));
++		    limit + 1);
+ 		if (length < 0) {
+ 			int error = errno;
+ 
+@@ -159,7 +176,8 @@ verified_config_override(const char *path)
+ {
+ 	if (opening_raw_startup_file)
+ 		return (NULL);
+-	if (verified_config_find(path) != NULL ||
++	if (verified_kernel_allowed(path) ||
++	    verified_config_find(path) != NULL ||
+ 	    strncmp(path, "/boot/forth/", sizeof ("/boot/forth/") - 1) == 0 ||
+ 	    strncmp(path, "/boot/conf.d/", sizeof ("/boot/conf.d/") - 1) == 0 ||
+ 	    strncmp(path, "/boot/defaults/",
+@@ -226,7 +244,7 @@ verified_config_init(void)
+ 		struct verified_startup_file *snapshot =
+ 		    &verified_startup_files[i];
+ 		ssize_t length = verified_config_read_file(snapshot->path,
+-		    snapshot->bytes, sizeof (snapshot->bytes));
++		    snapshot->bytes, VERIFIED_CONFIG_LIMIT + 1);
+ 
+ 		if (length < 0 || !valparaiso_check_boot_file(verified_manifest,
+ 		    mlen, snapshot->path + 1, snapshot->bytes, length)) {
+@@ -238,5 +256,6 @@ verified_config_init(void)
+ 
+ 	verified_manifest_length = mlen;
+ 	stand_file_override = verified_config_override;
++	archsw.arch_kernel_allowed = verified_kernel_allowed;
+ 	return (true);
+ }

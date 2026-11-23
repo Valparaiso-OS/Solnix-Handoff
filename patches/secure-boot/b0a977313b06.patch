@@ -1,0 +1,94 @@
+From b0a977313b06bafed1e0d41afaedddb40b3919e0 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Require and snapshot optional configuration listed in the manifest
+
+diff --git a/usr/src/boot/efi/loader/verified-config.h b/usr/src/boot/efi/loader/verified-config.h
+--- a/usr/src/boot/efi/loader/verified-config.h
++++ b/usr/src/boot/efi/loader/verified-config.h
+@@ -301,12 +301,25 @@ verified_confdir_stat(struct open_file *file __unused, struct stat *st)
+ 
+ static const char verified_confdir_prefix[] = "/boot/conf.d/";
+ 
++static bool
++verified_optional_config(const char *path)
++{
++	return (strcmp(path, "/boot/menu.rc") == 0 ||
++	    strcmp(path, "/boot/menu.rc.local") == 0 ||
++	    strcmp(path, "/boot/loader.rc.local") == 0 ||
++	    strcmp(path, "/boot/loader.conf.local") == 0 ||
++	    strcmp(path, "/boot/solaris/bootenv.rc") == 0);
++}
++
+ static int
+ verified_confdir_readdir(struct open_file *file, struct dirent *entry)
+ {
+ 	const struct verified_startup_file *fragment = file->f_fsdata;
+ 	const char *name;
+ 
++	while (fragment != NULL && strncmp(fragment->path,
++	    verified_confdir_prefix, sizeof (verified_confdir_prefix) - 1) != 0)
++		fragment = fragment->next;
+ 	if (fragment == NULL)
+ 		return (ENOENT);
+ 	name = fragment->path + sizeof (verified_confdir_prefix) - 1;
+@@ -359,12 +372,7 @@ verified_config_override(const char *path, int mode)
+ 	    verified_config_find(path) != NULL ||
+ 	    strncmp(path, "/boot/forth/", sizeof ("/boot/forth/") - 1) == 0 ||
+ 	    strncmp(path, "/boot/defaults/",
+-	    sizeof ("/boot/defaults/") - 1) == 0 ||
+-	    strcmp(path, "/boot/menu.rc") == 0 ||
+-	    strcmp(path, "/boot/menu.rc.local") == 0 ||
+-	    strcmp(path, "/boot/loader.rc.local") == 0 ||
+-	    strcmp(path, "/boot/loader.conf.local") == 0 ||
+-	    strcmp(path, "/boot/solaris/bootenv.rc") == 0)
++	    sizeof ("/boot/defaults/") - 1) == 0)
+ 		return (&verified_config_ops);
+ 	return (&verified_denied_ops);
+ }
+@@ -418,7 +426,7 @@ verified_firmware_enforcing(void)
+ 
+ /*
+  * The manifest has already passed signature and format validation. Pin each
+- * flat conf.d entry in manifest order before exposing it to the interpreter.
++ * listed config fragment and optional startup file before running Forth.
+  */
+ static bool
+ verified_load_fragments(void)
+@@ -444,18 +452,28 @@ verified_load_fragments(void)
+ 		if (newline == NULL || newline - row < 66)
+ 			goto fail;
+ 		name = row + 66;
+-		if ((size_t)(newline - name) <= prefix_length ||
+-		    strncmp(name, verified_confdir_prefix + 1,
+-		    prefix_length) != 0)
+-			continue;
+-		name += prefix_length;
+ 		name_length = newline - name;
+-		if (name_length > MAXNAMLEN ||
+-		    memchr(name, '/', name_length) != NULL)
+-			goto fail;
++		if (name_length >= sizeof (path) - 1) {
++			if (strncmp(name, verified_confdir_prefix + 1,
++			    prefix_length) == 0)
++				goto fail;
++			continue;
++		}
++		path[0] = '/';
++		bcopy(name, path + 1, name_length);
++		path[name_length + 1] = '\0';
+ 
+-		(void) snprintf(path, sizeof (path), "%s%.*s",
+-		    verified_confdir_prefix, (int)name_length, name);
++		if (name_length > prefix_length &&
++		    strncmp(name, verified_confdir_prefix + 1,
++		    prefix_length) == 0) {
++			name += prefix_length;
++			name_length -= prefix_length;
++			if (name_length > MAXNAMLEN ||
++			    memchr(name, '/', name_length) != NULL)
++				goto fail;
++		} else if (!verified_optional_config(path)) {
++			continue;
++		}
+ 		length = verified_config_read_file(path, bytes, sizeof (bytes));
+ 		if (length < 0 || !valparaiso_check_boot_file(verified_manifest,
+ 		    verified_manifest_length, path + 1, bytes, length)) {

@@ -1,0 +1,250 @@
+From b6ff990eb62cb3a1e759336a391dbfcd3e0a125c Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Enforce authenticated loader.conf in the amd64 EFI QA build
+
+diff --git a/usr/src/boot/efi/loader/Makefile.com b/usr/src/boot/efi/loader/Makefile.com
+--- a/usr/src/boot/efi/loader/Makefile.com
++++ b/usr/src/boot/efi/loader/Makefile.com
+@@ -41,6 +41,9 @@ module.o := CPPFLAGS += -I$(CRYPTOSRC)
+ tem.o := CPPFLAGS += $(DEFAULT_CONSOLE_COLOR)
+ main.o := CPPFLAGS += -I$(SRC)/uts/common/fs/zfs
+ 
++# Supplying the verifier object enables mandatory configuration checking.
++main.o := CPPFLAGS += $(CONFIG_VERIFY_OBJ:%=-DVALPARAISO_VERIFY_CONFIG)
++
+ CPPFLAGS += -I../../../include -I../../../sys
+ CPPFLAGS += -I../../../libsa
+ 
+@@ -132,8 +135,8 @@ LIBEFI=		-L../../libefi/$(MACHINE) -lefi
+ DPADD=		$(DPLIBFICL) $(DPLIBEFI) $(DPLIBSA) $(LDSCRIPT)
+ LDADD=		$(LIBFICL) $(LIBEFI) $(LIBSA)
+ 
+-loader.sym:	$(OBJS) $(DPADD)
+-	$(GLD) $(LDFLAGS) -o $@ $(OBJS) $(LDADD)
++loader.sym:	$(OBJS) $(DPADD) $(CONFIG_VERIFY_OBJ)
++	$(GLD) $(LDFLAGS) -o $@ $(OBJS) $(CONFIG_VERIFY_OBJ) $(LDADD)
+ 
+ machine:
+ 	$(RM) machine
+diff --git a/usr/src/boot/efi/loader/amd64/Makefile b/usr/src/boot/efi/loader/amd64/Makefile
+--- a/usr/src/boot/efi/loader/amd64/Makefile
++++ b/usr/src/boot/efi/loader/amd64/Makefile
+@@ -21,6 +21,8 @@ EFIPROG=	loader64.efi
+ 
+ all:		$(EFIPROG)
+ 
++CONFIG_VERIFY_OBJ = $(VALPARAISO_VERIFY_OBJ)
++
+ include ../Makefile.com
+ 
+ EFI_TARGET=	pei-x86-64
+diff --git a/usr/src/boot/efi/loader/main.c b/usr/src/boot/efi/loader/main.c
+--- a/usr/src/boot/efi/loader/main.c
++++ b/usr/src/boot/efi/loader/main.c
+@@ -676,6 +676,10 @@ uefi_serial_console(void)
+ 	return (NULL);
+ }
+ 
++#ifdef VALPARAISO_VERIFY_CONFIG
++#include "verified-config.h"
++#endif
++
+ EFI_STATUS
+ main(int argc, CHAR16 *argv[])
+ {
+@@ -935,6 +939,13 @@ main(int argc, CHAR16 *argv[])
+ 		if (!interactive_interrupt("Failed to find bootable partition"))
+ 			return (EFI_NOT_FOUND);
+ 
++#ifdef VALPARAISO_VERIFY_CONFIG
++	if (!verified_config_init()) {
++		printf("Valparaiso loader.conf verification failed\n");
++		return (EFI_SECURITY_VIOLATION);
++	}
++#endif
++
+ 	autoload_font(false);		/* Set up the font list for console. */
+ 	efi_init_environment();
+ 	bi_isadir();			/* set ISADIR */
+diff --git a/usr/src/boot/efi/loader/verified-config.h b/usr/src/boot/efi/loader/verified-config.h
+--- a/usr/src/boot/efi/loader/verified-config.h
++++ b/usr/src/boot/efi/loader/verified-config.h
+@@ -0,0 +1,136 @@
++/*
++ * This file and its contents are supplied under the terms of the
++ * Common Development and Distribution License ("CDDL"), version 1.0.
++ * You may only use this file in accordance with the terms of version
++ * 1.0 of the CDDL.
++ *
++ * A full copy of the text of the CDDL should have accompanied this
++ * source. A copy is also available at http://www.illumos.org/license/CDDL.
++ */
++
++extern int valparaiso_check_config(const void *, size_t, const void *, size_t,
++    const void *, size_t);
++
++static unsigned char verified_config[64 * 1024 + 1];
++static size_t verified_config_length;
++
++static int
++verified_config_open(const char *path __unused, struct open_file *file)
++{
++	return (file->f_flags == (F_READ | F_NODEV) ? 0 : EACCES);
++}
++
++static int
++verified_config_read(struct open_file *file, void *buffer, size_t size,
++    size_t *resid)
++{
++	size_t count = verified_config_length - (size_t)file->f_offset;
++
++	if (count > size)
++		count = size;
++	bcopy(verified_config + file->f_offset, buffer, count);
++	file->f_offset += count;
++	*resid = size - count;
++	return (0);
++}
++
++static off_t
++verified_config_seek(struct open_file *file, off_t offset, int where)
++{
++	off_t base;
++	off_t length = verified_config_length;
++
++	switch (where) {
++	case SEEK_SET:
++		base = 0;
++		break;
++	case SEEK_CUR:
++		base = file->f_offset;
++		break;
++	case SEEK_END:
++		base = length;
++		break;
++	default:
++		errno = EINVAL;
++		return (-1);
++	}
++	if (offset < -base || offset > length - base) {
++		errno = EINVAL;
++		return (-1);
++	}
++	return (file->f_offset = base + offset);
++}
++
++static int
++verified_config_stat(struct open_file *file __unused, struct stat *st)
++{
++	bzero(st, sizeof (*st));
++	st->st_mode = S_IFREG | 0444;
++	st->st_size = verified_config_length;
++	return (0);
++}
++
++static struct fs_ops verified_config_ops = {
++	.fs_name = "verified-config",
++	.fo_open = verified_config_open,
++	.fo_close = null_close,
++	.fo_read = verified_config_read,
++	.fo_write = null_write,
++	.fo_seek = verified_config_seek,
++	.fo_stat = verified_config_stat,
++	.fo_readdir = null_readdir
++};
++
++static struct fs_ops *
++verified_config_override(const char *path)
++{
++	if (strcmp(path, "/boot/loader.conf") == 0)
++		return (&verified_config_ops);
++	return (NULL);
++}
++
++static ssize_t
++verified_config_read_file(const char *path, unsigned char *buffer, size_t limit)
++{
++	int fd = open(path, O_RDONLY | F_GZIP);
++	size_t length = 0;
++	ssize_t count;
++
++	if (fd == -1)
++		return (-1);
++	while (length < limit) {
++		count = read(fd, buffer + length, limit - length);
++		if (count < 0) {
++			(void) close(fd);
++			return (-1);
++		}
++		if (count == 0)
++			break;
++		length += count;
++	}
++	(void) close(fd);
++	return (length == limit ? -1 : (ssize_t)length);
++}
++
++static bool
++verified_config_init(void)
++{
++	static unsigned char manifest[64 * 1024 + 1];
++	static unsigned char signature[3309 + 1];
++	ssize_t mlen, slen, clen;
++
++	mlen = verified_config_read_file("/boot.manifest", manifest,
++	    sizeof (manifest));
++	slen = verified_config_read_file("/boot.manifest.sig", signature,
++	    sizeof (signature));
++	clen = verified_config_read_file("/boot/loader.conf", verified_config,
++	    sizeof (verified_config));
++	if (mlen < 0 || slen < 0 || clen < 0 ||
++	    !valparaiso_check_config(manifest, mlen, signature, slen,
++	    verified_config, clen))
++		return (false);
++
++	verified_config_length = clen;
++	stand_file_override = verified_config_override;
++	return (true);
++}
+diff --git a/usr/src/boot/libsa/open.c b/usr/src/boot/libsa/open.c
+--- a/usr/src/boot/libsa/open.c
++++ b/usr/src/boot/libsa/open.c
+@@ -135,6 +135,8 @@ o_rainit(struct open_file *f)
+ 	f->f_raoffset = 0;
+ }
+ 
++struct fs_ops *(*stand_file_override)(const char *);
++
+ int
+ open(const char *fname, int mode)
+ {
+@@ -155,6 +157,19 @@ open(const char *fname, int mode)
+ 	f->f_devdata = NULL;
+ 	file = NULL;
+ 
++	/*
++	 * The platform can supply an in-memory file before device lookup.
++	 * Failure opening an overridden file must never fall back to disk.
++	 */
++	if (stand_file_override != NULL &&
++	    (fs = stand_file_override(fname)) != NULL) {
++		f->f_flags |= F_NODEV;
++		error = fs->fo_open(fname, f);
++		if (error == 0)
++			goto ok;
++		goto err;
++	}
++
+ 	if (exclusive_file_system != NULL) {
+ 		fs = exclusive_file_system;
+ 		error = (fs->fo_open)(fname, f);
+diff --git a/usr/src/boot/libsa/stand.h b/usr/src/boot/libsa/stand.h
+--- a/usr/src/boot/libsa/stand.h
++++ b/usr/src/boot/libsa/stand.h
+@@ -287,6 +287,7 @@ extern void	ngets(char *, int);
+ #define	gets(x)	ngets((x), 0)
+ extern int	fgetstr(char *buf, int size, int fd);
+ 
++extern struct fs_ops *(*stand_file_override)(const char *);
+ extern int	open(const char *, int);
+ #define	O_RDONLY	0x0
+ #define	O_WRONLY	0x1

@@ -1,0 +1,22 @@
+From 0464cf7f851581dec85e23f98b698564df654c03 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Compile the interactive helper only in the non-enforcing EFI loader
+
+diff --git a/usr/src/boot/efi/loader/main.c b/usr/src/boot/efi/loader/main.c
+--- a/usr/src/boot/efi/loader/main.c
++++ b/usr/src/boot/efi/loader/main.c
+@@ -454,6 +454,7 @@ find_currdev(EFI_LOADED_IMAGE_PROTOCOL *img)
+ 	return (false);
+ }
+ 
++#ifndef VALPARAISO_VERIFY_CONFIG
+ static bool
+ interactive_interrupt(const char *msg)
+ {
+@@ -481,6 +482,7 @@ interactive_interrupt(const char *msg)
+ 	} while (now - then < fail_timeout);
+ 	return (false);
+ }
++#endif
+ 
+ static void
+ setenv_int(const char *key, int val)

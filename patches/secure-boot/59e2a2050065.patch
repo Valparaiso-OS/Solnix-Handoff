@@ -1,0 +1,140 @@
+From 59e2a205006552cc81647b1477e5847dfa8710a3 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Restrict raw boot modules and reject later executable loads in EFI QA
+
+diff --git a/usr/src/boot/common/bootstrap.h b/usr/src/boot/common/bootstrap.h
+--- a/usr/src/boot/common/bootstrap.h
++++ b/usr/src/boot/common/bootstrap.h
+@@ -368,7 +368,7 @@ struct arch_switch
+ 	 */
+ 	vm_offset_t (*arch_loadaddr)(uint_t type, void *data, vm_offset_t addr);
+ 	bool (*arch_kernel_allowed)(const char *path);
+-	bool (*arch_archive_allowed)(const char *path);
++	bool (*arch_raw_module_allowed)(const char *path, const char *type);
+ #define	LOAD_ELF	1	/* data points to the ELF header. */
+ #define	LOAD_RAW	2	/* data points to the module file name. */
+ #define	LOAD_KERN	3	/* data points to the kernel file name. */
+diff --git a/usr/src/boot/common/module.c b/usr/src/boot/common/module.c
+--- a/usr/src/boot/common/module.c
++++ b/usr/src/boot/common/module.c
+@@ -342,6 +342,11 @@ file_load(char *filename, vm_offset_t dest, struct preloaded_file **result)
+ 	int error;
+ 	int i;
+ 
++	if (preloaded_files != NULL && archsw.arch_raw_module_allowed != NULL) {
++		command_errmsg = "unsigned executable modules are disabled";
++		return (EAUTH);
++	}
++
+ 	if (preloaded_files == NULL) {
+ 		last_file_format = 0;
+ 		if (archsw.arch_kernel_allowed != NULL &&
+@@ -548,7 +553,7 @@ build_font_module(void)
+ 	struct font_info fi;
+ 	struct fontlist *fl;
+ 
+-	if (STAILQ_EMPTY(&fonts))
++	if (archsw.arch_raw_module_allowed != NULL || STAILQ_EMPTY(&fonts))
+ 		return;
+ 
+ 	/* We can't load first */
+@@ -669,7 +674,8 @@ file_assign_hash(int fd, size_t size, int argc, char **argv)
+ 			break;
+ 		}
+ 	}
+-	if (name == NULL)
++	if (name == NULL || (archsw.arch_raw_module_allowed != NULL &&
++	    !archsw.arch_raw_module_allowed(name, "rootfs")))
+ 		return (fp);
+ 
+ 	buf = malloc(size + 1);
+@@ -721,12 +727,11 @@ file_loadraw(const char *fname, char *type, int argc, char **argv, int insert)
+ 		return (NULL);
+ 	}
+ 
+-	/* The verified rootfs path needs no search or preliminary open. */
+-	if (archsw.arch_archive_allowed != NULL &&
+-	    strcmp(type, "rootfs") == 0) {
+-		if (!archsw.arch_archive_allowed(fname)) {
++	/* Verified module paths need no search or preliminary open. */
++	if (archsw.arch_raw_module_allowed != NULL) {
++		if (!archsw.arch_raw_module_allowed(fname, type)) {
+ 			command_errmsg =
+-			    "rootfs path outside verified boot policy";
++			    "module path or type outside verified boot policy";
+ 			return (NULL);
+ 		}
+ 		name = strdup(fname);
+@@ -762,8 +767,11 @@ file_loadraw(const char *fname, char *type, int argc, char **argv, int insert)
+ 	 */
+ 	if (strcmp(type, "hash") == 0) {
+ 		fp = file_assign_hash(fd, st.st_size, argc, argv);
+-		if (fp != NULL) {
++		if (fp != NULL || archsw.arch_raw_module_allowed != NULL) {
+ 			(void) close(fd);
++			if (fp == NULL)
++				command_errmsg = "cannot attach verified hash";
++			free(name);
+ 			return (fp);
+ 		}
+ 	}
+diff --git a/usr/src/boot/efi/loader/main.c b/usr/src/boot/efi/loader/main.c
+--- a/usr/src/boot/efi/loader/main.c
++++ b/usr/src/boot/efi/loader/main.c
+@@ -944,9 +944,9 @@ main(int argc, CHAR16 *argv[])
+ 		printf("Valparaiso startup file verification failed\n");
+ 		return (EFI_SECURITY_VIOLATION);
+ 	}
+-#endif
+-
++#else
+ 	autoload_font(false);		/* Set up the font list for console. */
++#endif
+ 	efi_init_environment();
+ 	bi_isadir();			/* set ISADIR */
+ 	acpi_detect();
+diff --git a/usr/src/boot/efi/loader/verified-config.h b/usr/src/boot/efi/loader/verified-config.h
+--- a/usr/src/boot/efi/loader/verified-config.h
++++ b/usr/src/boot/efi/loader/verified-config.h
+@@ -33,6 +33,8 @@ static ssize_t verified_config_read_file(const char *, unsigned char *, size_t);
+ 
+ static const char verified_archive_path[] =
+ 	"/platform/i86pc/amd64/boot_archive";
++static const char verified_archive_hash_path[] =
++	"/platform/i86pc/amd64/boot_archive.hash";
+ 
+ static const char verified_kernel_path[] =
+ 	"/platform/i86pc/kernel/amd64/unix";
+@@ -50,6 +52,17 @@ verified_archive_allowed(const char *path)
+ 	return (path != NULL && strcmp(path, verified_archive_path) == 0);
+ }
+ 
++static bool
++verified_raw_module_allowed(const char *path, const char *type)
++{
++	if (path == NULL || type == NULL)
++		return (false);
++	if (strcmp(type, "rootfs") == 0)
++		return (verified_archive_allowed(path));
++	return (strcmp(type, "hash") == 0 &&
++	    strcmp(path, verified_archive_hash_path) == 0);
++}
++
+ static bool
+ verified_kernel_allowed(const char *path)
+ {
+@@ -273,6 +286,7 @@ verified_config_override(const char *path, int mode)
+ 		return (mode == (O_RDONLY | F_GZIP) ?
+ 		    &verified_archive_raw_ops : &verified_archive_ops);
+ 	if (verified_kernel_allowed(path) ||
++	    strcmp(path, verified_archive_hash_path) == 0 ||
+ 	    verified_config_find(path) != NULL ||
+ 	    strncmp(path, "/boot/forth/", sizeof ("/boot/forth/") - 1) == 0 ||
+ 	    strncmp(path, "/boot/conf.d/", sizeof ("/boot/conf.d/") - 1) == 0 ||
+@@ -357,6 +371,6 @@ verified_config_init(void)
+ 	verified_archive_ops.fo_open = verified_archive_open;
+ 	stand_file_override = verified_config_override;
+ 	archsw.arch_kernel_allowed = verified_kernel_allowed;
+-	archsw.arch_archive_allowed = verified_archive_allowed;
++	archsw.arch_raw_module_allowed = verified_raw_module_allowed;
+ 	return (true);
+ }

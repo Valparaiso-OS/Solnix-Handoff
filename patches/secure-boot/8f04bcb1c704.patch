@@ -1,0 +1,210 @@
+From 8f04bcb1c7042f62ecd9ddba571dfa7c7d37f734 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Derive the EFI configuration directory from authenticated manifest entries
+
+diff --git a/usr/src/boot/efi/loader/verified-config.h b/usr/src/boot/efi/loader/verified-config.h
+--- a/usr/src/boot/efi/loader/verified-config.h
++++ b/usr/src/boot/efi/loader/verified-config.h
+@@ -19,11 +19,13 @@ struct verified_startup_file {
+ 	unsigned char *bytes;
+ 	EFI_PHYSICAL_ADDRESS address;
+ 	UINTN pages;
++	struct verified_startup_file *next;
+ };
+ 
+ static unsigned char verified_manifest[64 * 1024 + 1];
+ static size_t verified_manifest_length;
+ static bool opening_raw_startup_file;
++static struct verified_startup_file *verified_fragments;
+ 
+ static ssize_t verified_config_read_file(const char *, unsigned char *, size_t);
+ 
+@@ -77,6 +79,11 @@ verified_config_find(const char *path)
+ 		if (strcmp(path, verified_startup_files[i].path) == 0)
+ 			return (&verified_startup_files[i]);
+ 	}
++	for (struct verified_startup_file *fragment = verified_fragments;
++	    fragment != NULL; fragment = fragment->next) {
++		if (strcmp(path, fragment->path) == 0)
++			return (fragment);
++	}
+ 	return (NULL);
+ }
+ 
+@@ -274,53 +281,41 @@ static struct fs_ops verified_config_ops = {
+ 	.fo_readdir = null_readdir
+ };
+ 
+-/*
+- * Let Forth enumerate the configuration directory. Only its entries, never
+- * disk file data, are exposed through this descriptor.
+- */
++/* Expose the authenticated fragment set as a read-only directory. */
+ static int
+-verified_confdir_open(const char *path, struct open_file *file)
++verified_confdir_open(const char *path __unused, struct open_file *file)
+ {
+-	struct stat st;
+-	int fd;
+-
+ 	if (file->f_flags != (F_READ | F_NODEV))
+ 		return (EACCES);
+-	opening_raw_startup_file = true;
+-	fd = open(path, O_RDONLY | F_GZIP);
+-	opening_raw_startup_file = false;
+-	if (fd == -1)
+-		return (errno);
+-	if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode)) {
+-		(void) close(fd);
+-		return (ENOTDIR);
+-	}
+-	file->f_fsdata = fd2open_file(fd);
++	file->f_fsdata = verified_fragments;
+ 	return (0);
+ }
+ 
+ static int
+-verified_confdir_close(struct open_file *file)
++verified_confdir_stat(struct open_file *file __unused, struct stat *st)
+ {
+-	struct open_file *directory = file->f_fsdata;
+-
+-	return (close(directory->f_id) == 0 ? 0 : errno);
++	bzero(st, sizeof (*st));
++	st->st_mode = S_IFDIR | 0555;
++	return (0);
+ }
+ 
+-static int
+-verified_confdir_stat(struct open_file *file, struct stat *st)
+-{
+-	struct open_file *directory = file->f_fsdata;
+-
+-	return (directory->f_ops->fo_stat(directory, st));
+-}
++static const char verified_confdir_prefix[] = "/boot/conf.d/";
+ 
+ static int
+ verified_confdir_readdir(struct open_file *file, struct dirent *entry)
+ {
+-	struct open_file *directory = file->f_fsdata;
+-
+-	return (directory->f_ops->fo_readdir(directory, entry));
++	const struct verified_startup_file *fragment = file->f_fsdata;
++	const char *name;
++
++	if (fragment == NULL)
++		return (ENOENT);
++	name = fragment->path + sizeof (verified_confdir_prefix) - 1;
++	bzero(entry, sizeof (*entry));
++	(void) strlcpy(entry->d_name, name, sizeof (entry->d_name));
++	entry->d_namlen = strlen(name);
++	entry->d_type = DT_REG;
++	file->f_fsdata = fragment->next;
++	return (0);
+ }
+ 
+ static int
+@@ -333,7 +328,7 @@ verified_file_denied(const char *path __unused,
+ static struct fs_ops verified_confdir_ops = {
+ 	.fs_name = "verified-confdir",
+ 	.fo_open = verified_confdir_open,
+-	.fo_close = verified_confdir_close,
++	.fo_close = null_close,
+ 	.fo_read = null_read,
+ 	.fo_write = null_write,
+ 	.fo_seek = null_seek,
+@@ -363,7 +358,6 @@ verified_config_override(const char *path, int mode)
+ 	    strcmp(path, verified_archive_hash_path) == 0 ||
+ 	    verified_config_find(path) != NULL ||
+ 	    strncmp(path, "/boot/forth/", sizeof ("/boot/forth/") - 1) == 0 ||
+-	    strncmp(path, "/boot/conf.d/", sizeof ("/boot/conf.d/") - 1) == 0 ||
+ 	    strncmp(path, "/boot/defaults/",
+ 	    sizeof ("/boot/defaults/") - 1) == 0 ||
+ 	    strcmp(path, "/boot/menu.rc") == 0 ||
+@@ -422,6 +416,77 @@ verified_firmware_enforcing(void)
+ 	    &length)) && length == sizeof (setup_mode) && setup_mode == 0);
+ }
+ 
++/*
++ * The manifest has already passed signature and format validation. Pin each
++ * flat conf.d entry in manifest order before exposing it to the interpreter.
++ */
++static bool
++verified_load_fragments(void)
++{
++	static unsigned char bytes[VERIFIED_CONFIG_LIMIT + 1];
++	const char *row = (const char *)verified_manifest;
++	const char *end = row + verified_manifest_length;
++	const size_t prefix_length = sizeof (verified_confdir_prefix) - 2;
++	struct verified_startup_file **next = &verified_fragments;
++	const char *newline;
++
++	newline = memchr(row, '\n', end - row);
++	if (newline == NULL)
++		return (false);
++	for (row = newline + 1; row < end; row = newline + 1) {
++		char path[sizeof (verified_confdir_prefix) + MAXNAMLEN];
++		const char *name;
++		size_t name_length;
++		ssize_t length;
++		struct verified_startup_file *fragment;
++
++		newline = memchr(row, '\n', end - row);
++		if (newline == NULL || newline - row < 66)
++			goto fail;
++		name = row + 66;
++		if ((size_t)(newline - name) <= prefix_length ||
++		    strncmp(name, verified_confdir_prefix + 1,
++		    prefix_length) != 0)
++			continue;
++		name += prefix_length;
++		name_length = newline - name;
++		if (name_length > MAXNAMLEN ||
++		    memchr(name, '/', name_length) != NULL)
++			goto fail;
++
++		(void) snprintf(path, sizeof (path), "%s%.*s",
++		    verified_confdir_prefix, (int)name_length, name);
++		length = verified_config_read_file(path, bytes, sizeof (bytes));
++		if (length < 0 || !valparaiso_check_boot_file(verified_manifest,
++		    verified_manifest_length, path + 1, bytes, length)) {
++			printf("Valparaiso: rejected %s\n", path);
++			goto fail;
++		}
++		fragment = calloc(1, sizeof (*fragment) + strlen(path) + 1 +
++		    length);
++		if (fragment == NULL)
++			goto fail;
++		fragment->path = (char *)(fragment + 1);
++		(void) strcpy((char *)fragment->path, path);
++		fragment->length = length;
++		fragment->bytes = (unsigned char *)fragment->path +
++		    strlen(path) + 1;
++		bcopy(bytes, fragment->bytes, length);
++		*next = fragment;
++		next = &fragment->next;
++	}
++	return (true);
++
++fail:
++	while (verified_fragments != NULL) {
++		struct verified_startup_file *fragment = verified_fragments;
++
++		verified_fragments = fragment->next;
++		free(fragment);
++	}
++	return (false);
++}
++
+ static bool
+ verified_config_init(void)
+ {
+@@ -453,6 +518,8 @@ verified_config_init(void)
+ 	}
+ 
+ 	verified_manifest_length = mlen;
++	if (!verified_load_fragments())
++		return (false);
+ 	verified_archive_raw_ops = verified_config_ops;
+ 	verified_archive_raw_ops.fo_open = verified_archive_raw_open;
+ 	verified_archive_ops = gzipfs_fsops;
